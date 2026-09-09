@@ -28,6 +28,9 @@ impl BlockDiffusionDraftHead {
         window_size: Option<usize>,
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
+        // Proposer TP: `Some((rank, world))` shards the drafter column-parallel
+        // across the target's TP group (see `BlockDiffusionDraftHead::tp`).
+        tp: Option<(usize, usize)>,
         // Widest cross-sequence batch the drafter must serve in ONE forward.
         // The gamma-sized scratch below is allocated in per-sequence BANDS of
         // gamma rows so a batched propose can stack n sequences; nb == 1 keeps
@@ -63,13 +66,67 @@ impl BlockDiffusionDraftHead {
 
         let _ = target_hidden_size;
 
+        let mut weights = weights;
         let num_layers = weights.config.num_hidden_layers;
         let hidden_size = weights.config.hidden_size;
-        let intermediate_size = weights.config.intermediate_size;
-        let num_q_heads = weights.config.num_attention_heads;
-        let num_kv_heads = weights.config.num_key_value_heads;
+        let mut intermediate_size = weights.config.intermediate_size;
+        let mut num_q_heads = weights.config.num_attention_heads;
+        let mut num_kv_heads = weights.config.num_key_value_heads;
         let head_dim = weights.config.head_dim;
         let vocab_size = weights.config.vocab_size;
+        let tp = tp.filter(|(_, w)| *w >= 2);
+        if let Some((rank, world)) = tp {
+            // Column-parallel shard: every sharded quantity must divide evenly, and
+            // the FP8 drafter mirrors are built from full-width weights (not supported).
+            anyhow::ensure!(
+                world == 2,
+                "DFlash proposer TP supports world_size 2, got {world}"
+            );
+            anyhow::ensure!(
+                num_q_heads.is_multiple_of(world)
+                    && num_kv_heads.is_multiple_of(world)
+                    && intermediate_size.is_multiple_of(world)
+                    && hidden_size.is_multiple_of(world)
+                    && vocab_size.is_multiple_of(world),
+                "DFlash proposer TP: q_heads {num_q_heads} / kv_heads {num_kv_heads} / inter \
+                 {intermediate_size} / hidden {hidden_size} / vocab {vocab_size} must all divide by {world}"
+            );
+            anyhow::ensure!(
+                std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("1"),
+                "DFlash proposer TP is BF16-only (ATLAS_DFLASH_DRAFTER_FP8 not supported)"
+            );
+            let bf16 = 2usize;
+            let h = hidden_size;
+            let q_full = num_q_heads * head_dim;
+            let inter_full = intermediate_size;
+            num_q_heads /= world;
+            num_kv_heads /= world;
+            intermediate_size /= world;
+            let q_l = num_q_heads * head_dim;
+            let kv_l = num_kv_heads * head_dim;
+            let h_l = h / world;
+            // Row-major `[N, K]` weights: rank r's contiguous row slice is a byte offset.
+            // N-side shards (output columns): q/k/v/gate/up take rows of N = q/kv/inter;
+            // o_proj `[h, q_full]` and down_proj `[h, inter_full]` take rows of N = h and
+            // keep the FULL K (their input is all-gathered first).
+            for l in weights.layers.iter_mut() {
+                l.q_proj.weight = l.q_proj.weight.offset(rank * q_l * h * bf16);
+                l.k_proj.weight = l.k_proj.weight.offset(rank * kv_l * h * bf16);
+                l.v_proj.weight = l.v_proj.weight.offset(rank * kv_l * h * bf16);
+                l.gate_proj.weight = l
+                    .gate_proj
+                    .weight
+                    .offset(rank * intermediate_size * h * bf16);
+                l.up_proj.weight = l.up_proj.weight.offset(rank * intermediate_size * h * bf16);
+                l.o_proj.weight = l.o_proj.weight.offset(rank * h_l * q_full * bf16);
+                l.down_proj.weight = l.down_proj.weight.offset(rank * h_l * inter_full * bf16);
+            }
+            tracing::info!(
+                "DFlash proposer TP: rank {rank}/{world} — local q_heads {num_q_heads}, kv_heads \
+                 {num_kv_heads}, inter {intermediate_size}, o/down/fc rows {h_l}, lm_head rows {}",
+                vocab_size / world
+            );
+        }
         // The HEAD's gamma is the SSOT the serve layer reads back, so the
         // drafter's checkpoint must drive the default here, `block_size`
         // alone is the top-level field, whose serde default of 16 silently
@@ -328,6 +385,16 @@ impl BlockDiffusionDraftHead {
         let rows_max = n_attn.max(nb * gamma_val);
         let q_dim = num_q_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
+        // Proposer TP half-width staging: the largest local output any gather
+        // moves — the fc projection over up to `ctx_window` ctx rows (`h / w`
+        // wide), the lm_head over `nb * g` rows (`vocab / w` wide), or an
+        // o_proj/down_proj output (`h / w` wide).
+        let tp_half_bytes = |w: usize| -> usize {
+            (ctx_window * (hidden_size / w))
+                .max(nb * g * (vocab_size / w))
+                .max(nb * g * (hidden_size / w))
+                * bf16
+        };
         let scratch = DflashScratch {
             stream_buf: gpu.alloc(rows_max * hidden_size * bf16)?,
             norm_buf: gpu.alloc(rows_max * hidden_size * bf16)?,
@@ -424,6 +491,22 @@ impl BlockDiffusionDraftHead {
                     .unwrap_or(256)
                     .max(1);
                 gpu.alloc(nb * g * rank * bf16)?
+            } else {
+                DevicePtr(0)
+            },
+            tp_local: if let Some((_, w)) = tp {
+                gpu.alloc(tp_half_bytes(w))?
+            } else {
+                DevicePtr(0)
+            },
+            tp_recv: if let Some((_, w)) = tp {
+                gpu.alloc(tp_half_bytes(w))?
+            } else {
+                DevicePtr(0)
+            },
+            tp_bytes: tp.map(|(_, w)| tp_half_bytes(w)).unwrap_or(0),
+            tp_full: if let Some((_, w)) = tp {
+                gpu.alloc(nb * g * q_dim.max(intermediate_size) * w * bf16)?
             } else {
                 DevicePtr(0)
             },
@@ -573,6 +656,14 @@ impl BlockDiffusionDraftHead {
             num_layers,
         );
 
+        if let Some((rank, world)) = tp {
+            // fc `[h, target_layers * target_hidden]`: rank r's `h / world` output rows.
+            let t = target_layer_ids.len() * target_hidden_size;
+            weights.fc.weight = weights
+                .fc
+                .weight
+                .offset(rank * (hidden_size / world) * t * 2);
+        }
         let mut head = Self {
             num_layers,
             hidden_size,
@@ -630,6 +721,7 @@ impl BlockDiffusionDraftHead {
             // from each layer's k_proj/v_proj. precompute_ctx_kv will
             // GEMM against it in stage 3 once we wire the call site.
             fused_kv_weight: Some(fused_kv_weight),
+            tp,
             kv_cache: Mutex::new(kv_cache),
             scratch,
             kernels,

@@ -194,6 +194,18 @@ pub struct DflashScratch {
     pub draft_tokens_event: u64,
     pub logits: DevicePtr,
     pub draft_tokens_dev: DevicePtr,
+    /// Proposer TP (`BlockDiffusionDraftHead::tp`): this rank's half of a
+    /// column-parallel GEMM output whose FULL-width home is an existing
+    /// scratch buffer (`stream_acc`, `fc_proj`, `logits`). `DevicePtr(0)` when off.
+    pub tp_local: DevicePtr,
+    /// Proposer TP: the peer rank's half, landed by `ncclRecv` (same size as `tp_local`).
+    pub tp_recv: DevicePtr,
+    /// Proposer TP: capacity in bytes of `tp_local` / `tp_recv`.
+    pub tp_bytes: usize,
+    /// Proposer TP: full-width `[rows][world * w_local]` staging for the two
+    /// K-side inputs per layer (`attn_out` before o_proj, the activated MLP
+    /// intermediate before down_proj).
+    pub tp_full: DevicePtr,
     /// `[ctx_window + γ]` i32 positions. First ctx_window are
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
@@ -468,6 +480,19 @@ pub struct BlockDiffusionDraftHead {
     /// stage 3: pyref bit-exact diff). Layout (K then V per layer) chosen
     /// to match vLLM's `_fused_kv_weight` in `qwen3_dflash.py:381-389`.
     pub fused_kv_weight: Option<DevicePtr>,
+
+    /// Proposer TP lane (`ATLAS_DFLASH_PROPOSER_TP=1`, 2026-09-09): `Some((rank,
+    /// world))` when the drafter is column-parallel across the target's TP
+    /// group. Then `num_q_heads` / `num_kv_heads` / `intermediate_size` are
+    /// this rank's LOCAL counts, every drafter weight pointer is offset to this
+    /// rank's contiguous row slice of the replicated tensor, and the two
+    /// K-side inputs per layer (o_proj, down_proj) plus every hidden/vocab-wide
+    /// output (o_proj, down_proj, fc, lm_head) are all-gathered with
+    /// [`Self::tp_gather_rows`]. `hidden_size` and `vocab_size` stay FULL.
+    /// Bit-identical to the unsharded drafter by construction: every output
+    /// element is the same dot product over the same K in the same kernel;
+    /// only WHICH rows a rank computes changes, and gathers are copies.
+    pub tp: Option<(usize, usize)>,
 
     /// Paged FP8 KV cache. One cache holding all `num_layers` drafter layers,
     /// laid out the same way the target's KV cache is — block-table-keyed,
@@ -1079,5 +1104,122 @@ impl BlockDiffusionDraftHead {
             ctx_committed: 0,
             ctx_positions: Vec::new(),
         }))
+    }
+}
+
+impl BlockDiffusionDraftHead {
+    /// Proposer TP: all-gather `rows` rows of `w_local` bytes (this rank's half
+    /// in `local`, laid out `[rows][w_local]`) and write the row-interleaved
+    /// FULL layout `[rows][world * w_local]` into `full`. NCCL p2p on the
+    /// compute stream (graph-capturable, same as the verify all-reduce) plus two
+    /// pitched D2D copies: pure data movement, byte-exact.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tp_gather_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        ctx: &crate::layer::ForwardContext,
+        local: DevicePtr,
+        full: DevicePtr,
+        rows: usize,
+        w_local: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let Some((rank, world)) = self.tp else {
+            anyhow::bail!("tp_gather_rows: drafter is not tensor-parallel");
+        };
+        anyhow::ensure!(
+            world == 2,
+            "DFlash proposer TP supports world_size 2, got {world}"
+        );
+        let comm = ctx.comm.ok_or_else(|| {
+            anyhow::anyhow!(
+                "DFlash proposer TP: ForwardContext has no comm (needs_comm() must be true)"
+            )
+        })?;
+        let bytes = rows * w_local;
+        anyhow::ensure!(
+            bytes <= self.scratch.tp_bytes,
+            "tp_gather_rows: {bytes} B exceeds tp scratch {}",
+            self.scratch.tp_bytes
+        );
+        let peer = 1 - rank;
+        comm.group_start()?;
+        comm.send_to(local.0, bytes, peer, stream)?;
+        comm.recv_from(self.scratch.tp_recv.0, bytes, peer, stream)?;
+        comm.group_end()?;
+        let pitch = world * w_local;
+        gpu.copy_d2d_2d_async(
+            local,
+            w_local,
+            full.offset(rank * w_local),
+            pitch,
+            w_local,
+            rows,
+            stream,
+        )?;
+        gpu.copy_d2d_2d_async(
+            self.scratch.tp_recv,
+            w_local,
+            full.offset(peer * w_local),
+            pitch,
+            w_local,
+            rows,
+            stream,
+        )?;
+        Ok(())
+    }
+
+    /// The drafter's BF16 lm_head over `rows` rows of `input` (`[rows][k]`) into
+    /// `scratch.logits` (`[rows][vocab]`). Under proposer TP each rank streams its
+    /// contiguous `vocab / world` row slice of the replicated `lm_head_shared`
+    /// and the halves are gathered into the same full logits layout, so the
+    /// unchanged `dflash2_topk16` / argmax see byte-identical rows.
+    pub(crate) fn lm_head_bf16_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        ctx: &crate::layer::ForwardContext,
+        input: DevicePtr,
+        rows: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some((rank, world)) = self.tp {
+            let v_l = self.vocab_size / world;
+            let w_l = DenseWeight {
+                weight: self.lm_head_shared.offset(rank * v_l * k as usize * 2),
+            };
+            self.gemm_bf16_rows(
+                gpu,
+                input,
+                &w_l,
+                self.scratch.tp_local,
+                rows,
+                v_l as u32,
+                k,
+                stream,
+            )?;
+            return self.tp_gather_rows(
+                gpu,
+                ctx,
+                self.scratch.tp_local,
+                self.scratch.logits,
+                rows as usize,
+                v_l * 2,
+                stream,
+            );
+        }
+        let w = DenseWeight {
+            weight: self.lm_head_shared,
+        };
+        self.gemm_bf16_rows(
+            gpu,
+            input,
+            &w,
+            self.scratch.logits,
+            rows,
+            self.vocab_size as u32,
+            k,
+            stream,
+        )
     }
 }

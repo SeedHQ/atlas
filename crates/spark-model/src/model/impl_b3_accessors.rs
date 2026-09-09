@@ -23,6 +23,13 @@ impl TransformerModel {
     pub fn config_ref(&self) -> &ModelConfig {
         &self.config
     }
+    /// `(rank, world_size)` of the model's communicator when it spans >= 2 ranks.
+    pub fn tp_rank_world(&self) -> Option<(usize, usize)> {
+        self.comm
+            .as_ref()
+            .map(|c| (c.rank(), c.world_size()))
+            .filter(|(_, w)| *w >= 2)
+    }
 
     /// Install a DFlash drafter as the active proposer, replacing whatever
     /// MTP proposer (if any) `TransformerModel::new` built. The target's

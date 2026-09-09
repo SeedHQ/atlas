@@ -1030,6 +1030,19 @@ pub fn build_model(
             1, // tp_size for the drafter side: replicated, so always 1
         )?;
         if let Some(weights) = weights {
+            // Proposer TP lane: shard the drafter across the target's TP group.
+            // `ATLAS_DFLASH_PROPOSER_TP_SHARD=0` keeps the lockstep-replicated
+            // form (stage A instrument: every rank runs the full drafter).
+            let dflash_tp = if crate::speculative::dflash_proposer_tp_enabled()
+                && std::env::var("ATLAS_DFLASH_PROPOSER_TP_SHARD")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            {
+                model.tp_rank_world()
+            } else {
+                None
+            };
             let head = crate::layers::BlockDiffusionDraftHead::from_weights(
                 weights,
                 target_embed_for_dflash,
@@ -1041,6 +1054,7 @@ pub fn build_model(
                 args.window_size,
                 model.gpu_backend(),
                 max_seq_len,
+                dflash_tp,
                 max_batch_size,
             )?;
             model.set_dflash_proposer(std::sync::Arc::new(head));

@@ -117,16 +117,41 @@ impl BlockDiffusionDraftHead {
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.gemm_bf16_rows(
-            gpu,
-            src,
-            &self.fc,
-            self.scratch.fc_proj,
-            n,
-            h,
-            target_hidden_dim as u32,
-            stream,
-        )?;
+        if let Some((_, world)) = self.tp {
+            // Column-parallel fc: this rank's `h / world` output rows over the full
+            // K, gathered into the full-width `fc_proj` for hidden_norm.
+            let h_l = h / world as u32;
+            self.gemm_bf16_rows(
+                gpu,
+                src,
+                &self.fc,
+                self.scratch.tp_local,
+                n,
+                h_l,
+                target_hidden_dim as u32,
+                stream,
+            )?;
+            self.tp_gather_rows(
+                gpu,
+                ctx,
+                self.scratch.tp_local,
+                self.scratch.fc_proj,
+                n as usize,
+                h_l as usize * bf16,
+                stream,
+            )?;
+        } else {
+            self.gemm_bf16_rows(
+                gpu,
+                src,
+                &self.fc,
+                self.scratch.fc_proj,
+                n,
+                h,
+                target_hidden_dim as u32,
+                stream,
+            )?;
+        }
         dump_buf(
             "fc_proj",
             self.scratch.fc_proj,

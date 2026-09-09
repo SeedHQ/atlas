@@ -1011,14 +1011,48 @@ impl BlockDiffusionDraftHead {
         //   stream_acc ← o_proj(attn_out); stream_buf still holds the
         //   PRE-layernorm residual (saved implicitly — stream_buf was not
         //   modified since 3a wrote norm_buf from it).
-        gemm_swap(
-            &layer.o_proj,
-            &layer.o_proj_fp8,
-            self.scratch.attn_out,
-            self.scratch.stream_acc,
-            h,
-            q_dim,
-        )?;
+        if let Some((_, world)) = self.tp {
+            // Column-parallel o_proj: gather the per-rank attention heads into the
+            // FULL `[g][world * q_dim]` K-side input, compute this rank's `h / world`
+            // output rows, then gather those into the full-width `stream_acc`.
+            let w = world as u32;
+            let rows = g as usize;
+            self.tp_gather_rows(
+                gpu,
+                ctx,
+                self.scratch.attn_out,
+                self.scratch.tp_full,
+                rows,
+                q_dim as usize * 2,
+                stream,
+            )?;
+            gemm_swap(
+                &layer.o_proj,
+                &layer.o_proj_fp8,
+                self.scratch.tp_full,
+                self.scratch.tp_local,
+                h / w,
+                q_dim * w,
+            )?;
+            self.tp_gather_rows(
+                gpu,
+                ctx,
+                self.scratch.tp_local,
+                self.scratch.stream_acc,
+                rows,
+                (h / w) as usize * 2,
+                stream,
+            )?;
+        } else {
+            gemm_swap(
+                &layer.o_proj,
+                &layer.o_proj_fp8,
+                self.scratch.attn_out,
+                self.scratch.stream_acc,
+                h,
+                q_dim,
+            )?;
+        }
 
         // DFlash2: attention_conv.finish — second application on the o_proj
         // output, using the dynamic slice computed at prepare (pre_attn).
@@ -1106,14 +1140,47 @@ impl BlockDiffusionDraftHead {
             g * inter,
             stream,
         )?;
-        gemm_swap(
-            &layer.down_proj,
-            &layer.down_proj_fp8,
-            self.scratch.mlp_intermediate,
-            self.scratch.stream_acc,
-            h,
-            inter,
-        )?;
+        if let Some((_, world)) = self.tp {
+            // Column-parallel down_proj: same shape as o_proj above with the
+            // activated `[g][inter]` local intermediate as the gathered K-side input.
+            let w = world as u32;
+            let rows = g as usize;
+            self.tp_gather_rows(
+                gpu,
+                ctx,
+                self.scratch.mlp_intermediate,
+                self.scratch.tp_full,
+                rows,
+                inter as usize * 2,
+                stream,
+            )?;
+            gemm_swap(
+                &layer.down_proj,
+                &layer.down_proj_fp8,
+                self.scratch.tp_full,
+                self.scratch.tp_local,
+                h / w,
+                inter * w,
+            )?;
+            self.tp_gather_rows(
+                gpu,
+                ctx,
+                self.scratch.tp_local,
+                self.scratch.stream_acc,
+                rows,
+                (h / w) as usize * 2,
+                stream,
+            )?;
+        } else {
+            gemm_swap(
+                &layer.down_proj,
+                &layer.down_proj_fp8,
+                self.scratch.mlp_intermediate,
+                self.scratch.stream_acc,
+                h,
+                inter,
+            )?;
+        }
 
         // DFlash2: mlp_conv.finish on the down_proj output.
         let mlp_res_src = self.conv_finish(

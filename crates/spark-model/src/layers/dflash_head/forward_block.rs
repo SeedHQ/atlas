@@ -712,32 +712,10 @@ impl BlockDiffusionDraftHead {
                         )?;
                     }
                 } else {
-                    self.gemm_bf16_rows(
-                        gpu,
-                        norm_noise_local,
-                        &crate::weight_map::DenseWeight {
-                            weight: self.lm_head_shared,
-                        },
-                        self.scratch.logits,
-                        g,
-                        self.vocab_size as u32,
-                        h_local,
-                        stream,
-                    )?;
+                    self.lm_head_bf16_rows(gpu, ctx, norm_noise_local, g, h_local, stream)?;
                 }
             } else {
-                self.gemm_bf16_rows(
-                    gpu,
-                    norm_noise_local,
-                    &crate::weight_map::DenseWeight {
-                        weight: self.lm_head_shared,
-                    },
-                    self.scratch.logits,
-                    g,
-                    self.vocab_size as u32,
-                    h_local,
-                    stream,
-                )?;
+                self.lm_head_bf16_rows(gpu, ctx, norm_noise_local, g, h_local, stream)?;
             }
             // DFlash2: selector path — per-row top-16 + single-launch chain
             // walk (dflash2.rs). Device-side only; captures into the tail
