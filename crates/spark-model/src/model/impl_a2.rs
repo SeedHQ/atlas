@@ -787,6 +787,7 @@ mod kgamma_tests {
             0xFFFF_FFFF, // shutdown
         ];
         assert!(!existing.contains(&EP_CMD_VERIFY_KGAMMA));
-        assert!(EP_CMD_VERIFY_KGAMMA >= 0xFFFF_FFE0);
+        // Compile-time: the opcode lives in the command band, above every token id.
+        const _: () = assert!(EP_CMD_VERIFY_KGAMMA >= 0xFFFF_FFE0);
     }
 }

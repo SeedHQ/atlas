@@ -466,7 +466,7 @@ impl BlockDiffusionDraftHead {
                     );
                     rope_kind = "yarn";
                 }
-                Some(t) if t == "default" => {
+                Some("default") => {
                     // transformers' `rope_parameters: {rope_type: "default"}` IS plain RoPE.
                     tracing::info!(
                         "DFlash RoPE = plain (rope_type=default), theta={rope_theta}, {n_pairs} pairs",
