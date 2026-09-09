@@ -91,10 +91,6 @@ impl BlockDiffusionDraftHead {
                 "DFlash proposer TP: q_heads {num_q_heads} / kv_heads {num_kv_heads} / inter \
                  {intermediate_size} / hidden {hidden_size} / vocab {vocab_size} must all divide by {world}"
             );
-            anyhow::ensure!(
-                std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("1"),
-                "DFlash proposer TP is BF16-only (ATLAS_DFLASH_DRAFTER_FP8 not supported)"
-            );
             let bf16 = 2usize;
             let h = hidden_size;
             let q_full = num_q_heads * head_dim;
@@ -946,6 +942,13 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?);
             }
+            // Proposer TP shards the BF16 weights by pointer offset; the FP8 mirrors
+            // above were quantized from those (already-local) slices with full-width
+            // shapes, so the two cannot be combined.
+            anyhow::ensure!(
+                tp.is_none(),
+                "DFlash proposer TP is BF16-only: set ATLAS_DFLASH_DRAFTER_FP8=0"
+            );
             head.quant = DflashQuantization::Fp8Weights;
             tracing::info!(
                 "DFlash Phase G: drafter weights ready as FP8 (quant = Fp8Weights). \
