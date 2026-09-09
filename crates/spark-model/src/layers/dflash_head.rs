@@ -644,6 +644,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
         Some(self.gamma)
     }
 
+    /// Proposer TP lane (`ATLAS_DFLASH_PROPOSER_TP=1`): the head broadcasts
+    /// `EP_CMD_MTP_PROPOSE` before every propose and the worker runs this same
+    /// forward in lockstep. Off (default): rank-0-only, `comm: None`.
+    fn needs_comm(&self) -> bool {
+        crate::speculative::dflash_proposer_tp_enabled()
+    }
+
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         self.alloc_state_windowed(gpu, usize::MAX)
     }

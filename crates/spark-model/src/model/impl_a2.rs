@@ -540,13 +540,41 @@ impl TransformerModel {
                 if let Err(e) = self.save_hidden_for_mtp(hidden_idx, stream) {
                     tracing::warn!("EP worker save_hidden_for_mtp({hidden_idx}) failed: {e:#}");
                 }
-                if let Err(e) =
-                    self.run_mtp_propose_inner(last_token, position, num_drafts, seq, None)
-                {
-                    // Never fail the worker on a drafter error: rank 0 decides what is
-                    // verified, so a degraded worker draft costs acceptance, not correctness.
-                    // Bailing here would desynchronise the command stream instead.
-                    tracing::warn!("EP worker MTP propose failed (continuing): {e:#}");
+                match self.run_mtp_propose_inner(last_token, position, num_drafts, seq, None) {
+                    Ok(drafts) => {
+                        // Proposer TP lane identity instrument: the head logs the same
+                        // line as `DFLASH_TP r0`; equal draft vectors per position on
+                        // both ranks = the worker's drafter state is in lockstep.
+                        if crate::speculative::dflash_proposer_tp_enabled() {
+                            tracing::info!(
+                                "DFLASH_TP r1 drafts position={position} last_token={last_token} {drafts:?}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Never fail the worker on a drafter error: rank 0 decides what is
+                        // verified, so a degraded worker draft costs acceptance, not correctness.
+                        // Bailing here would desynchronise the command stream instead.
+                        tracing::warn!("EP worker MTP propose failed (continuing): {e:#}");
+                    }
+                }
+            }
+            crate::speculative::EP_CMD_DFLASH_CTX_COMMIT => {
+                // Proposer TP lane: mirror one scheduler-side DFlash ctx commit
+                // (serial-decode / batched-verify sites) with the head's exact arguments.
+                let mode = self.ep_broadcast_u32(0)?;
+                let num_committed = self.ep_broadcast_u32(0)? as usize;
+                let base_pos = self.ep_broadcast_u32(0)? as usize;
+                let scratch_row = self.ep_broadcast_u32(0)? as usize;
+                let r = match mode {
+                    0 => self.commit_ctx(seq, num_committed, base_pos, scratch_row),
+                    1 => self.dflash_serial_ctx_append(seq),
+                    m => Err(anyhow::anyhow!(
+                        "EP_CMD_DFLASH_CTX_COMMIT: unknown mode {m}"
+                    )),
+                };
+                if let Err(e) = r {
+                    tracing::warn!("EP worker DFlash ctx commit (mode {mode}) failed: {e:#}");
                 }
             }
             0xFFFFFFF3 => {
@@ -631,6 +659,27 @@ impl TransformerModel {
                     seq.tokens.pop();
                 }
                 seq.seq_len -= pop;
+                // Proposer TP lane: the head broadcasts its ctx-commit choice and
+                // arguments right after `num_accepted` (`verify_dflash_step.rs`), and
+                // this rank applies the same commit at the same point — BEFORE
+                // `commit_accepted_prefix`, as the head does. mode 0 = `commit_ctx`,
+                // 1 = `dflash_eagle_kgamma_append`, 2 = neither.
+                if crate::speculative::dflash_proposer_tp_enabled() {
+                    let mode = self.ep_broadcast_u32(0)?;
+                    let n = self.ep_broadcast_u32(0)? as usize;
+                    let base_pos = self.ep_broadcast_u32(0)? as usize;
+                    let row = self.ep_broadcast_u32(0)? as usize;
+                    let r = match mode {
+                        0 => self.commit_ctx(seq, n, base_pos, row),
+                        1 => self.dflash_eagle_kgamma_append(seq, n, base_pos),
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = r {
+                        tracing::warn!(
+                            "EP worker DFlash K=γ ctx commit (mode {mode}) failed: {e:#}"
+                        );
+                    }
+                }
                 self.commit_accepted_prefix(seq, total_accepted, k)?;
                 self.trim_proposer_state(seq, num_accepted, 0)?;
             }

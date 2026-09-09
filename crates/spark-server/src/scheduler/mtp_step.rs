@@ -267,15 +267,16 @@ pub fn step_mtp(
             // so commit and propose decode-append never both cover a token.
             if !will_propose || reprobe_resume {
                 let base_pos = a.seq.seq_len.saturating_sub(1);
+                ep_mirror_dflash_ctx(model, a.seq.slot_idx, 0, 1, base_pos, 0);
                 if let Err(e) = model.commit_ctx(&mut a.seq, 1, base_pos, 0) {
                     tracing::error!("commit_ctx (mtp serial): {e:#}");
                 }
             }
-        } else if sched.levers.dflash_serial_append
-            && (!will_propose || reprobe_resume)
-            && let Err(e) = model.dflash_serial_ctx_append(&mut a.seq)
-        {
-            tracing::error!("dflash_serial_ctx_append: {e:#}");
+        } else if sched.levers.dflash_serial_append && (!will_propose || reprobe_resume) {
+            ep_mirror_dflash_ctx(model, a.seq.slot_idx, 1, 0, 0, 0);
+            if let Err(e) = model.dflash_serial_ctx_append(&mut a.seq) {
+                tracing::error!("dflash_serial_ctx_append: {e:#}");
+            }
         }
 
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {

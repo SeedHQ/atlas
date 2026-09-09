@@ -144,15 +144,19 @@ pub fn step_verify_dflash_batched(
             k,
             i * model.dflash_capture_band(),
         );
-        if sched.levers.dflash_unified_ctx
-            && let Err(e) = model.commit_ctx(
-                &mut a.seq,
+        if sched.levers.dflash_unified_ctx {
+            let row = i * model.dflash_capture_band();
+            ep_mirror_dflash_ctx(
+                model,
+                a.seq.slot_idx,
+                0,
                 num_accepted + 1,
                 pre_verify_len,
-                i * model.dflash_capture_band(),
-            )
-        {
-            tracing::error!("commit_ctx (dflash batched): {e:#}");
+                row,
+            );
+            if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len, row) {
+                tracing::error!("commit_ctx (dflash batched): {e:#}");
+            }
         }
 
         for j in 0..num_accepted {

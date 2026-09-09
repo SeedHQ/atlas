@@ -170,6 +170,29 @@ pub fn step_verify_dflash(
         num_accepted,
         drafts.len() + 1,
     );
+    // Proposer TP lane: tell the worker which commit to mirror, with the head's
+    // exact arguments, on the wire right after `num_accepted` (its K=γ arm reads
+    // these four words there). mode 0 = commit_ctx, 1 = eagle append, 2 = none.
+    let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() != Some("0");
+    if spark_model::speculative::dflash_proposer_tp_enabled() {
+        let (mode, n) = if sched.levers.dflash_unified_ctx {
+            (0u32, num_accepted + 1)
+        } else if eagle_fix {
+            (1u32, num_accepted)
+        } else {
+            (2u32, 0)
+        };
+        if let Err(e) = model
+            .ep_broadcast_cmd(mode)
+            .and_then(|()| model.ep_broadcast_cmd(n as u32))
+            .and_then(|()| model.ep_broadcast_cmd(pre_verify_len as u32))
+            .and_then(|()| model.ep_broadcast_cmd(0))
+        {
+            tracing::error!("EP broadcast verify_kgamma ctx commit: {e:#}");
+            a.finished = true;
+            return;
+        }
+    }
     if sched.levers.dflash_unified_ctx {
         if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len, 0) {
             tracing::error!("commit_ctx (kgamma): {e:#}");
@@ -177,7 +200,6 @@ pub fn step_verify_dflash(
     } else {
         // Default ON since the 54.5 record config (2026-08-19); `=0` is the
         // kill switch.
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() != Some("0");
         if eagle_fix
             && let Err(e) =
                 model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)

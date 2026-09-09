@@ -298,6 +298,26 @@ pub const EP_CMD_MTP_PROPOSE: u32 = 0xFFFF_FFF5;
 /// reservation envelope, not this width.
 pub const EP_CMD_VERIFY_KGAMMA: u32 = 0xFFFF_FFF6;
 
+/// EP worker command: mirror ONE scheduler-side DFlash ctx commit on the worker
+/// rank, so its `DflashProposerState` stays in lockstep with the head's
+/// (`ATLAS_DFLASH_PROPOSER_TP=1` only — see [`dflash_proposer_tp_enabled`]).
+/// Payload after the code: `mode` (0 = `commit_ctx`, 1 = `dflash_serial_ctx_append`),
+/// `num_committed`, `base_pos`, `scratch_row` (4 x u32).
+pub const EP_CMD_DFLASH_CTX_COMMIT: u32 = 0xFFFF_FFF7;
+
+/// `ATLAS_DFLASH_PROPOSER_TP=1`: run the DFlash drafter on EVERY rank (proposer
+/// tensor-parallel lane, 2026-09-09). Default OFF = the rank-0-only drafter,
+/// untouched. When ON: the rank-0 gates on the DFlash hidden captures are
+/// lifted, `BlockDiffusionDraftHead::needs_comm()` is true (so the head routes
+/// every propose through [`EP_CMD_MTP_PROPOSE`] and the worker runs the same
+/// drafter forward), the worker's K=γ arm mirrors the head's ctx commit, and the
+/// scheduler's serial ctx commits are mirrored via [`EP_CMD_DFLASH_CTX_COMMIT`].
+/// Read ONCE (some readers sit under CUDA-graph capture).
+pub fn dflash_proposer_tp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_PROPOSER_TP").ok().as_deref() == Some("1"))
+}
+
 /// Run the drafter on EVERY rank with the communicator, instead of rank-0-only
 /// with `comm: None`. **DEFAULT ON since 2026-08-29**; kill switch
 /// `ATLAS_NO_MTP_EP_PROPOSE=1` restores the rank-0-only path.

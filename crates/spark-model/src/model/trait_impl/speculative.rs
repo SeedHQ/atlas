@@ -502,7 +502,12 @@ impl TransformerModel {
                     .load(std::sync::atomic::Ordering::Relaxed) as u32,
             )?;
         }
-        self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
+        let drafts =
+            self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)?;
+        if crate::speculative::dflash_proposer_tp_enabled() {
+            tracing::info!("DFLASH_TP r0 drafts position={position} last_token={token} {drafts:?}");
+        }
+        Ok(drafts)
     }
 
     /// Batched cross-sequence propose (batched K=4 verify path). Target

@@ -313,6 +313,7 @@ impl TransformerModel {
         };
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !crate::speculative::dflash_proposer_tp_enabled()
         {
             return Ok(());
         }
@@ -359,6 +360,7 @@ impl TransformerModel {
         }
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !crate::speculative::dflash_proposer_tp_enabled()
         {
             return Ok(());
         }
@@ -404,6 +406,7 @@ impl TransformerModel {
         // Rank-0 gate (mirrors save_hidden_for_mtp's effective behavior).
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !crate::speculative::dflash_proposer_tp_enabled()
         {
             return Ok(());
         }
@@ -475,6 +478,7 @@ impl TransformerModel {
         };
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !crate::speculative::dflash_proposer_tp_enabled()
         {
             return Ok(());
         }

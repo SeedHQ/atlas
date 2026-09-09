@@ -385,6 +385,37 @@ pub fn step_ngram_verify(
 /// between `fill_bitmask` and the subsequent `accept_token` calls inside
 /// `emit_token`, while the MTP propose call borrows the model immutably —
 /// cloning sidesteps the lifetime overlap.
+/// Proposer TP lane (`ATLAS_DFLASH_PROPOSER_TP=1`): mirror a scheduler-side DFlash
+/// ctx commit on the worker rank. `mode` 0 = `commit_ctx(num_committed, base_pos,
+/// scratch_row)`, 1 = `dflash_serial_ctx_append`. Every broadcast is a no-op on a
+/// single rank; the switch off = no wire traffic at all. Call it IMMEDIATELY before
+/// the head's own commit so the worker's `DflashProposerState` advances in the same
+/// command order.
+pub fn ep_mirror_dflash_ctx(
+    model: &dyn Model,
+    slot_idx: usize,
+    mode: u32,
+    num_committed: usize,
+    base_pos: usize,
+    scratch_row: usize,
+) {
+    if !spark_model::speculative::dflash_proposer_tp_enabled() {
+        return;
+    }
+    if let Err(e) = model
+        .ep_broadcast_cmd_for_seq(
+            slot_idx as u32,
+            spark_model::speculative::EP_CMD_DFLASH_CTX_COMMIT,
+        )
+        .and_then(|()| model.ep_broadcast_cmd(mode))
+        .and_then(|()| model.ep_broadcast_cmd(num_committed as u32))
+        .and_then(|()| model.ep_broadcast_cmd(base_pos as u32))
+        .and_then(|()| model.ep_broadcast_cmd(scratch_row as u32))
+    {
+        tracing::error!("EP broadcast dflash ctx commit: {e:#}");
+    }
+}
+
 pub fn mtp_grammar_mask_for(a: &mut ActiveSeq) -> Option<Vec<i32>> {
     if a.inside_thinking {
         return None;

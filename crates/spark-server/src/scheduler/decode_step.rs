@@ -108,15 +108,16 @@ pub fn step_decode_only(
             // Unified ctx commit: serial token at RoPE position seq_len-1
             // (decode advanced seq_len past the token just processed).
             let base_pos = a.seq.seq_len.saturating_sub(1);
+            ep_mirror_dflash_ctx(model, a.seq.slot_idx, 0, 1, base_pos, i);
             if let Err(e) = model.commit_ctx(&mut a.seq, 1, base_pos, i) {
                 tracing::error!("commit_ctx (decode_only, row {i}): {e:#}");
             }
         }
-    } else if n == 1
-        && sched.levers.dflash_serial_append
-        && let Err(e) = model.dflash_serial_ctx_append(&mut active[0].seq)
-    {
-        tracing::error!("dflash_serial_ctx_append (decode_only): {e:#}");
+    } else if n == 1 && sched.levers.dflash_serial_append {
+        ep_mirror_dflash_ctx(model, active[0].seq.slot_idx, 1, 0, 0, 0);
+        if let Err(e) = model.dflash_serial_ctx_append(&mut active[0].seq) {
+            tracing::error!("dflash_serial_ctx_append (decode_only): {e:#}");
+        }
     }
 
     process_decode_logits(
