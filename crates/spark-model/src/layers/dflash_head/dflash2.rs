@@ -39,6 +39,46 @@ pub(super) enum ConvSite {
     Mlp,
 }
 
+/// DFlash2-site BF16 GEMM row dispatch (conv dynamic-kernel projection and the
+/// selector `H(h_t)`): same `gemm_bf16_rows` batchm-or-tile choice as the six
+/// drafter sites, behind its own A/B kill switch `ATLAS_DFLASH2_BATCHM=0` so
+/// the two site classes can be measured independently in one image. OnceLock
+/// keeps the kernel choice stable across CUDA-graph capture.
+pub(crate) fn dflash2_batchm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DFLASH2_BATCHM").as_deref() != Ok("0"))
+}
+
+impl BlockDiffusionDraftHead {
+    #[allow(clippy::too_many_arguments)]
+    fn dflash2_gemm_bf16(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        input: DevicePtr,
+        weight: &crate::weight_map::DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if dflash2_batchm_enabled() {
+            return self.gemm_bf16_rows(gpu, input, weight, output, m, n, k, stream);
+        }
+        ops::dense_gemm_bf16_pipelined(
+            gpu,
+            self.kernels.dense_gemm_pipelined,
+            input,
+            weight,
+            output,
+            m,
+            n,
+            k,
+            stream,
+        )
+    }
+}
+
 impl BlockDiffusionDraftHead {
     /// True when the DFlash2 conv+selector path should run: checkpoint
     /// shipped the components, kernels compiled for this target, and the
@@ -133,9 +173,8 @@ impl BlockDiffusionDraftHead {
         let groups = h / self.conv_group_size as u32;
         let dyn_cols = 2 * self.conv_kernel_size as u32 * groups;
         // Dynamic kernels for BOTH applications, from the PRE-conv hidden.
-        ops::dense_gemm_bf16_pipelined(
+        self.dflash2_gemm_bf16(
             ctx.gpu,
-            self.kernels.dense_gemm_pipelined,
             hidden_in,
             &crate::weight_map::DenseWeight { weight: proj },
             self.scratch.conv_dyn,
@@ -232,9 +271,8 @@ impl BlockDiffusionDraftHead {
             .launch(stream)?;
 
         // H(h_t): [γ, hidden] → [γ, rank].
-        ops::dense_gemm_bf16_pipelined(
+        self.dflash2_gemm_bf16(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             norm_noise,
             hproj,
             self.scratch.sel_hproj,
