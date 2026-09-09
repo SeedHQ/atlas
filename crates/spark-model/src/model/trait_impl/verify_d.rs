@@ -177,7 +177,19 @@ impl TransformerModel {
         let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let use_graphs = self.comm.is_none()
+        // EXPERIMENT (2026-09-07, spark-bench quick 260907-n5o): capture the γ-block verify
+        // under EP too, opt-IN via ATLAS_DFLASH_VERIFY_GRAPHS=1. Mirrors verify_c.rs's
+        // ATLAS_GLM_VERIFY_GRAPHS (the native K=3 path, graphed under EP since 2026-08-29,
+        // byte-identical to eager) but on its own name so neither gate can move the other's
+        // output. The `comm.is_none()` exclusion below carries no recorded reason (it dates to
+        // the initial import); what this path actually lacked versus verify_c was the A56/A62
+        // replay reconcile — added at the replay site below. Read ONCE (OnceLock): the choice
+        // must be stable across capture and replay.
+        static EP_GRAPHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ep_graphs = *EP_GRAPHS.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_VERIFY_GRAPHS").ok().as_deref() == Some("1")
+        });
+        let use_graphs = (self.comm.is_none() || ep_graphs)
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -222,7 +234,20 @@ impl TransformerModel {
         if let Some(graph) = cached_for_slot
             && graph.0 != 0
         {
+            // 🔴 Same two protections as verify_c.rs (native K=3), in the same order.
+            // BEFORE the replay: the graph writes GLM-5.3's DSA indexer row from a device
+            // position with no host code in the loop; past the DSA ceiling it writes one row
+            // off the end and a sticky CUDA 700 takes the serve down — ANOMALIES A62.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;
+            }
             self.gpu.launch_graph(graph, stream)?;
+            // AFTER the replay: a replay runs kernels and NOTHING else, so per-sequence HOST
+            // bookkeeping (the DSA indexer cache length) must be reconciled to `seq_len + k`
+            // here, exactly as verify_c.rs does — ANOMALIES A56. No-op for KDA / non-DSA layers.
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;
+            }
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
