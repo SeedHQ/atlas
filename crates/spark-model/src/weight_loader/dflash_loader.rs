@@ -130,7 +130,12 @@ pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
 /// `BlockDiffusionDraftHead` (layer count, head_dim, vocab_size, the
 /// `target_layer_ids` capture indices).
 pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
-    serde_json::from_str(json).context("Parsing DFlash drafter config.json")
+    let config: DflashConfig =
+        serde_json::from_str(json).context("Parsing DFlash drafter config.json")?;
+    config
+        .validate()
+        .context("Validating DFlash drafter config.json")?;
+    Ok(config)
 }
 
 /// Load DFlash drafter weights from a separate [`WeightStore`] pointing at

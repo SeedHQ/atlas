@@ -164,6 +164,33 @@ pub(crate) fn load_dflash_drafter(
         })?;
     let drafter_config =
         spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+    // The drafter's attention window is CLI-only (`--dflash-window-size`,
+    // default 4096). A checkpoint trained at another width (GLM-5.3 DFlash2:
+    // 2048) runs out-of-distribution with no error — say so at load.
+    if let Some(trained) = drafter_config.sliding_window
+        && trained != args.dflash_window_size
+    {
+        tracing::warn!(
+            "DFlash: drafter config declares sliding_window={trained} but the serve runs \
+             --dflash-window-size {} — pass --dflash-window-size {trained} to match the \
+             drafter's training (the config value is NOT applied automatically)",
+            args.dflash_window_size
+        );
+    }
+    tracing::info!(
+        "DFlash drafter config: dflash2={} rope_theta={} rms_norm_eps={} block_size={} \
+         sliding_window={:?} target_layer_ids={:?}",
+        drafter_config.is_dflash2(),
+        drafter_config.effective_rope_theta(),
+        drafter_config.rms_norm_eps,
+        drafter_config.effective_block_size(),
+        drafter_config.sliding_window,
+        drafter_config
+            .dflash_config
+            .as_ref()
+            .map(|c| c.target_layer_ids.clone())
+            .unwrap_or_default(),
+    );
     // ── DFlash footprint pre-flight (2026-08-19) ────────────────────────
     // Every byte below lands OUTSIDE the KV planner's view until it is
     // already allocated, and on GB10's unified LPDDR5X an over-commit is

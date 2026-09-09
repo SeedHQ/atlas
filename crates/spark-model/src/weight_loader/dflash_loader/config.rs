@@ -29,9 +29,27 @@ pub struct DflashConfig {
     /// DFlash-specific nested config object.
     #[serde(default)]
     pub dflash_config: Option<DflashSubConfig>,
-    /// Drafter base RoPE θ. Defaults to 10M (matches Qwen3.6-DFlash).
+    /// Drafter base RoPE θ, TOP-LEVEL form. Defaults to 10M (matches
+    /// Qwen3.6-DFlash). Read through [`DflashConfig::effective_rope_theta`],
+    /// which lets a nested `rope_parameters.rope_theta` win.
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    /// RMSNorm epsilon for every drafter norm (`hidden_norm`, per-layer
+    /// input/post norms, `q_norm`/`k_norm`, final `norm`). Qwen3-lineage
+    /// drafters ship 1e-6; the GLM-5.3 DFlash2 drafters ship 1e-5. Was a
+    /// hardcoded 1e-6 in `from_weights.rs` before this field existed.
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f32,
+    /// HF `architectures` list. `"DFlash2DraftModel"` marks a DFlash2 drafter,
+    /// whose selector/conv fields are then REQUIRED (see [`DflashConfig::validate`]).
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    /// Trained sliding window of the drafter's attention layers, when declared.
+    /// NOT consumed by the runtime — the window is CLI-only
+    /// (`--dflash-window-size`); the serve compares the two and warns on
+    /// mismatch so an operator sees a 4096-vs-2048 drift before measuring.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
     /// HF-style `rope_scaling` block. `None` ⇒ plain RoPE (the v2 2026-04-27
     /// Qwen3.6-DFlash drafter ships `rope_scaling: null`). When present and
     /// `rope_type == "yarn"`, the drafter's YaRN parameters are used to
@@ -72,6 +90,13 @@ fn default_rope_theta() -> f32 {
     10_000_000.0
 }
 
+fn default_rms_norm_eps() -> f32 {
+    1e-6
+}
+
+/// HF `architectures` entry that names a DFlash2 drafter.
+pub const DFLASH2_ARCHITECTURE: &str = "DFlash2DraftModel";
+
 /// Subset of HF `rope_scaling` block consumed by Atlas. Mirrors the field
 /// names in `transformers`' Qwen3 config so `serde_json::from_str` works
 /// directly on the drafter's `config.json`.
@@ -81,6 +106,14 @@ pub struct DflashRopeScaling {
     /// plain RoPE with a warning logged at construction time.
     #[serde(default)]
     pub rope_type: Option<String>,
+    /// Base RoPE θ when the checkpoint states it INSIDE this block. Newer
+    /// transformers releases (`rope_parameters`, incoai DFlash2) put θ here and
+    /// ship NO top-level `rope_theta`; without this field the nested value was
+    /// dropped and the top-level default (10M) won silently — a 1000× RoPE
+    /// error on `incoai/GLM-5.3-Flash-DFlash2` (θ = 10 000). Resolved through
+    /// [`DflashConfig::effective_rope_theta`]; never read this field directly.
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
     #[serde(default)]
     pub factor: Option<f32>,
     #[serde(default)]
@@ -153,5 +186,83 @@ impl DflashConfig {
             .as_ref()
             .and_then(|c| c.block_size)
             .unwrap_or(self.block_size)
+    }
+
+    /// Resolved base RoPE θ: the nested `rope_parameters.rope_theta` when the
+    /// checkpoint states it there, else the top-level field (or its 10M default).
+    ///
+    /// The nested form wins because a checkpoint that ships it ships ONLY it —
+    /// the top-level field is then serde's default, not the drafter's value.
+    pub fn effective_rope_theta(&self) -> f32 {
+        self.rope_scaling
+            .as_ref()
+            .and_then(|r| r.rope_theta)
+            .unwrap_or(self.rope_theta)
+    }
+
+    /// Whether this checkpoint declares itself a DFlash2 drafter.
+    ///
+    /// Either the HF `architectures` tag OR any DFlash2-only field being set
+    /// counts: a checkpoint that ships selector weights under a mislabelled
+    /// architecture must still be validated as DFlash2, never silently loaded
+    /// as DFlash1 with the selector/conv path disabled.
+    pub fn is_dflash2(&self) -> bool {
+        self.architectures.iter().any(|a| a == DFLASH2_ARCHITECTURE)
+            || self.dflash_config.as_ref().is_some_and(|c| {
+                c.conv_kernel_size != 0
+                    || c.conv_group_size != 0
+                    || c.selector_rank != 0
+                    || c.selector_top_k != 0
+            })
+    }
+
+    /// Fail-closed structural checks, run by `parse_dflash_config` right after
+    /// deserialisation so a defective config never reaches the weight loader.
+    ///
+    /// The DFlash2 fields are `#[serde(default)]` (a DFlash1 checkpoint has
+    /// none of them), so a DFlash2 checkpoint missing ONE of them would
+    /// otherwise deserialise with a silent 0 — indistinguishable from "not a
+    /// DFlash2 drafter" — and `dflash2_active()` would quietly turn the
+    /// selector off. Here that is an error with the field named.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let sub = match self.dflash_config.as_ref() {
+            Some(s) => s,
+            None => {
+                if self.is_dflash2() {
+                    anyhow::bail!(
+                        "DFlash2 drafter config declares {DFLASH2_ARCHITECTURE} but has no \
+                         `dflash_config` block"
+                    );
+                }
+                return Ok(());
+            }
+        };
+        if sub.target_layer_ids.is_empty() {
+            anyhow::bail!("DFlash drafter config: `dflash_config.target_layer_ids` is empty");
+        }
+        if (sub.mask_token_id as usize) >= self.vocab_size {
+            anyhow::bail!(
+                "DFlash drafter config: mask_token_id {} is outside vocab_size {}",
+                sub.mask_token_id,
+                self.vocab_size
+            );
+        }
+        if self.is_dflash2() {
+            for (name, v) in [
+                ("conv_kernel_size", sub.conv_kernel_size),
+                ("conv_group_size", sub.conv_group_size),
+                ("selector_rank", sub.selector_rank),
+                ("selector_top_k", sub.selector_top_k),
+            ] {
+                if v == 0 {
+                    anyhow::bail!(
+                        "DFlash2 drafter config: `dflash_config.{name}` is missing or 0 — \
+                         every DFlash2 field is required (fail-closed; a 0 here would \
+                         silently disable the selector/conv path)"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }

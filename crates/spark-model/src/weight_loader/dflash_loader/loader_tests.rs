@@ -118,3 +118,160 @@ fn effective_block_size_falls_back_to_the_top_level() {
     let cfg = parse_dflash_config(json).expect("parses");
     assert_eq!(cfg.effective_block_size(), 16);
 }
+
+// ── incoai/GLM-5.3-Flash-DFlash2 (config.json read live from the Hub, 2026-09-06) ──
+//
+// Everything the Qwen fixture above coincidentally shares with Atlas's old
+// defaults, this one does not: θ is NESTED (10 000, not the 10M default),
+// rms_norm_eps is 1e-5 (not the hardcoded 1e-6), the block size lives in
+// `dflash_config`, and the four DFlash2 fields are all present.
+const INCOAI_GLM53_FLASH_DFLASH2_CONFIG: &str = r#"{
+  "architectures": ["DFlash2DraftModel"],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": null,
+  "dflash_config": {
+    "block_size": 8,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 154856,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "target_layer_ids": [5, 14, 24, 33, 42]
+  },
+  "dtype": "bfloat16",
+  "eos_token_id": [154820, 154827, 154829],
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "initializer_range": 0.02,
+  "intermediate_size": 12288,
+  "is_causal": false,
+  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+  "max_position_embeddings": 1048576,
+  "max_window_layers": 5,
+  "model_type": "qwen3",
+  "num_attention_heads": 32,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_target_layers": 45,
+  "pad_token_id": 154820,
+  "rms_norm_eps": 1e-05,
+  "rope_parameters": {
+    "rope_theta": 10000.0,
+    "rope_type": "default"
+  },
+  "sliding_window": 2048,
+  "tie_word_embeddings": false,
+  "transformers_version": "5.7.0",
+  "use_cache": false,
+  "use_sliding_window": true,
+  "vocab_size": 154880
+}"#;
+
+#[test]
+fn glm53_flash_dflash2_nested_rope_theta_wins_over_the_default() {
+    let c = parse_dflash_config(INCOAI_GLM53_FLASH_DFLASH2_CONFIG).expect("parse");
+    // The top-level field is serde's default — the checkpoint never set it.
+    assert_eq!(c.rope_theta, 10_000_000.0);
+    // The resolved value is the nested one.
+    assert_eq!(c.effective_rope_theta(), 10_000.0);
+    let rs = c
+        .rope_scaling
+        .as_ref()
+        .expect("rope_parameters aliased onto rope_scaling");
+    assert_eq!(rs.rope_type.as_deref(), Some("default"));
+    assert_eq!(rs.rope_theta, Some(10_000.0));
+}
+
+#[test]
+fn glm53_flash_dflash2_rms_norm_eps_and_shape_reach_the_runtime() {
+    let c = parse_dflash_config(INCOAI_GLM53_FLASH_DFLASH2_CONFIG).expect("parse");
+    assert_eq!(c.rms_norm_eps, 1e-5);
+    assert_eq!(c.hidden_size, 4096);
+    assert_eq!(c.intermediate_size, 12288);
+    assert_eq!(c.num_hidden_layers, 5);
+    assert_eq!(c.num_attention_heads, 32);
+    assert_eq!(c.num_key_value_heads, 8);
+    assert_eq!(c.head_dim, 128);
+    assert_eq!(c.vocab_size, 154880);
+    assert_eq!(c.sliding_window, Some(2048));
+    assert_eq!(
+        c.effective_block_size(),
+        8,
+        "block size is NESTED; top-level default 16 must not win"
+    );
+    let sub = c.dflash_config.as_ref().unwrap();
+    assert_eq!(sub.mask_token_id, 154856);
+    assert_eq!(sub.target_layer_ids, vec![5, 14, 24, 33, 42]);
+    assert_eq!(sub.conv_kernel_size, 2);
+    assert_eq!(sub.conv_group_size, 16);
+    assert_eq!(sub.selector_rank, 256);
+    assert_eq!(sub.selector_top_k, 16);
+    assert!(c.is_dflash2());
+}
+
+#[test]
+fn qwen_dflash1_fixture_keeps_its_old_defaults() {
+    // The certified drafter must be unaffected: top-level θ, eps 1e-6, DFlash1.
+    let c = parse_dflash_config(SHIPPED_CONFIG).expect("parse");
+    assert_eq!(c.effective_rope_theta(), 10_000_000.0);
+    assert_eq!(c.rms_norm_eps, 1e-6);
+    assert!(!c.is_dflash2());
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn nested_rope_theta_beats_top_level_when_both_are_present() {
+    let c = parse_dflash_config(
+        r#"{
+            "hidden_size": 64, "num_hidden_layers": 1, "intermediate_size": 128,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
+            "vocab_size": 256, "rope_theta": 5.0,
+            "rope_parameters": {"rope_theta": 7.0, "rope_type": "default"}
+        }"#,
+    )
+    .expect("parse");
+    assert_eq!(c.effective_rope_theta(), 7.0);
+}
+
+/// Fail-closed: a DFlash2 checkpoint missing ONE selector/conv field used to
+/// deserialise with a silent 0 (indistinguishable from "not DFlash2") and
+/// quietly disable the selector. Now it is a parse error naming the field.
+#[test]
+fn dflash2_missing_selector_field_is_a_parse_error() {
+    let broken = INCOAI_GLM53_FLASH_DFLASH2_CONFIG.replace(r#""selector_top_k": 16,"#, "");
+    assert!(
+        !broken.contains("selector_top_k"),
+        "fixture edit must remove the key"
+    );
+    let err = parse_dflash_config(&broken).expect_err("must fail closed");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("selector_top_k"),
+        "error must name the field: {msg}"
+    );
+}
+
+#[test]
+fn dflash2_architecture_without_dflash_config_block_is_rejected() {
+    let err = parse_dflash_config(
+        r#"{
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": 64, "num_hidden_layers": 1, "intermediate_size": 128,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
+            "vocab_size": 256
+        }"#,
+    )
+    .expect_err("must fail closed");
+    assert!(format!("{err:#}").contains("dflash_config"));
+}
+
+#[test]
+fn mask_token_outside_vocab_is_rejected() {
+    let broken = INCOAI_GLM53_FLASH_DFLASH2_CONFIG
+        .replace(r#""vocab_size": 154880"#, r#""vocab_size": 154856"#);
+    let err =
+        parse_dflash_config(&broken).expect_err("mask_token_id == vocab_size is out of range");
+    assert!(format!("{err:#}").contains("mask_token_id"));
+}

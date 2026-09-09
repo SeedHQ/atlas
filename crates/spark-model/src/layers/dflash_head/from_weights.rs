@@ -415,7 +415,10 @@ impl BlockDiffusionDraftHead {
         // 64, pairs 11..26 ramped). Result: drafter Q/K rotations landed in
         // the wrong angular basis at every layer → 0% draft acceptance. Now
         // we read the drafter's own scaling block instead of guessing.
-        let rope_theta = weights.config.rope_theta;
+        // Nested `rope_parameters.rope_theta` wins over the top-level field —
+        // the GLM-5.3 DFlash2 drafter ships θ = 10 000 nested and nothing
+        // top-level, where the old direct read produced the 10M default.
+        let rope_theta = weights.config.effective_rope_theta();
         let rotary_dim = head_dim; // Qwen3.6-DFlash applies rope to full head_dim
         let dim_f = rotary_dim as f32;
         let n_pairs = rotary_dim / 2;
@@ -462,6 +465,13 @@ impl BlockDiffusionDraftHead {
                          max_pos={orig_max_pos}, low_dim={low:.1}, high_dim={high:.1}",
                     );
                     rope_kind = "yarn";
+                }
+                Some(t) if t == "default" => {
+                    // transformers' `rope_parameters: {rope_type: "default"}` IS plain RoPE.
+                    tracing::info!(
+                        "DFlash RoPE = plain (rope_type=default), theta={rope_theta}, {n_pairs} pairs",
+                    );
+                    rope_kind = "plain";
                 }
                 Some(other) => {
                     tracing::warn!(
@@ -600,7 +610,7 @@ impl BlockDiffusionDraftHead {
             yarn_inv_freq,
             rope_theta,
             rotary_dim,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: weights.config.rms_norm_eps,
             ctx_window,
             // Phase F: per-subgraph graph state — empty until the first
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
