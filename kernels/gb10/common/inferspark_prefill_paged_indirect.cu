@@ -39,7 +39,12 @@
         } \
     } while(0)
 
+// KERNEL_NAME is overridable so a width specialization can include this file
+// under its own symbol (inferspark_prefill_paged_indirect_h128.cu defines
+// HDIM=128 + KERNEL_NAME before including). Default build is unchanged.
+#ifndef KERNEL_NAME
 #define KERNEL_NAME inferspark_prefill_paged_indirect
+#endif
 #define K_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define V_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d,                          \

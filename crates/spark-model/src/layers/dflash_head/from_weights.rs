@@ -129,6 +129,20 @@ impl BlockDiffusionDraftHead {
         // against existing Atlas resolutions in `qwen3_attention/mod.rs` and
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
+        // A93 (2026-09-07): the γ-block paged-indirect attention module is
+        // compiled per head width. Picking it by the drafter's head_dim (not
+        // the target's) is what keeps a 128-wide drafter off the HDIM=256
+        // build, whose tiles read heads h and h+1 together (adjacent-head
+        // score contamination → later-row acceptance collapse, HANDOFF-08).
+        let paged_indirect = super::attn_width::paged_indirect_spec_for(head_dim)?;
+        super::attn_width::assert_width(paged_indirect, head_dim)?;
+        tracing::info!(
+            "DFlash γ-block paged-indirect attention: drafter head_dim={} → module `{}` (HDIM {})",
+            head_dim,
+            paged_indirect.module,
+            paged_indirect.hdim
+        );
+
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -174,10 +188,18 @@ impl BlockDiffusionDraftHead {
             // `q_offset` are read from device pointers at kernel entry, so the
             // graph-captured launch can be replayed with new dynamic values
             // without re-capture. See `inferspark_prefill_paged_indirect.cu`.
-            prefill_attn_dflash_bf16_indirect: gpu.kernel(
-                "prefill_paged_indirect",
-                "inferspark_prefill_paged_indirect",
-            )?,
+            prefill_attn_dflash_bf16_indirect: gpu
+                .kernel(paged_indirect.module, paged_indirect.func)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{e}\n\nDFlash needs the HDIM={} paged-indirect γ-block attention \
+                         kernel `{}` (kernels/<hw>/common/{}.cu) compiled for this target.",
+                        paged_indirect.hdim,
+                        paged_indirect.func,
+                        paged_indirect.func
+                    )
+                })?,
+            paged_indirect_hdim: paged_indirect.hdim,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,

@@ -59,8 +59,13 @@ pub struct DflashKernels {
     /// kernel scalar args. Used by the graph-captured forward_block path so a
     /// single graph instance can be replayed across steps with different
     /// dynamic values written to the indirect-args buffer pre-launch.
-    /// Resolves to kernel `inferspark_prefill_paged_indirect`.
+    /// Resolved by drafter `head_dim` (A93, 2026-09-07): 128 →
+    /// `inferspark_prefill_paged_indirect_h128`, 256 →
+    /// `inferspark_prefill_paged_indirect`. See `attn_width`.
     pub prefill_attn_dflash_bf16_indirect: KernelHandle,
+    /// Compile-time HDIM of the module behind `prefill_attn_dflash_bf16_indirect`.
+    /// Must equal the drafter `head_dim` (guarded at load; A93).
+    pub paged_indirect_hdim: u32,
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
@@ -573,6 +578,7 @@ pub struct BlockDiffusionDraftHead {
     pub selector_hidden_proj: Option<DenseWeight>,
 }
 
+pub mod attn_width;
 mod dflash2;
 /// Whether the Option-B paged drafter cache is on. Default ON since the 54.5
 /// record config (#649); `ATLAS_DFLASH_OPTION_B=0` is the kill switch.
