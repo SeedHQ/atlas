@@ -133,6 +133,8 @@ pub fn load_glm5next_mtp_module(
             // Neither: the highway does not exist here.
             is_first: false,
             is_last: false,
+            // The MTP block is never a DFlash capture layer.
+            capture_head_mean: false,
         },
         eh_proj: DenseWeight {
             weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,

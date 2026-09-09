@@ -141,6 +141,45 @@ pub struct Glm5NextLayer {
     pub is_first: bool,
     /// Collapse the highway here. True for the last TEXT layer only.
     pub is_last: bool,
+    /// Collapse the highway into `hidden` here TOO, because a DFlash drafter
+    /// captures this layer's output (`config.dflash_capture_layers`).
+    ///
+    /// 🔴 The DFlash capture (`impl_b3::try_dflash_capture*`) copies rows of
+    /// `buffers.hidden_states()` after a layer returns. On every other Atlas
+    /// model that buffer IS the residual stream. On GLM it is not: `glm_hc_pre`
+    /// overwrites `hidden` with a pre-norm mixing scratch at both sites of
+    /// every layer, and the real per-token residual lives in the
+    /// `[hc_mult, hidden]` stream highway, collapsed into `hidden` only at
+    /// `is_last` by `hc_head_mean`. A capture layer therefore needs the SAME
+    /// unweighted collapse here — the mean over the four streams — which is
+    /// also what the reference vLLM GLM DFlash2 capture does (`hc_post` then
+    /// `mean` over the hyper-connection axis; tonyd2wild, 2026-08-28,
+    /// 74 % draft acceptance). Writing it into `hidden` is safe: nothing reads
+    /// `hidden` between this layer's FFN `hc_post` and the next layer's
+    /// `hc_pre`, which rebuilds it from the streams.
+    pub capture_head_mean: bool,
+}
+
+/// Which text layers collapse the mHC highway into `hidden` for a DFlash
+/// capture — one flag per layer, from the drafter's `target_layer_ids`.
+///
+/// Fail-closed: an index outside `0..num_layers` is a load error, not a
+/// silent no-capture (a silent miss would leave the drafter's `fc` input
+/// stale for that slot, which degrades acceptance and nothing else).
+pub(crate) fn dflash_capture_flags(
+    num_layers: usize,
+    capture_layers: &[usize],
+) -> anyhow::Result<Vec<bool>> {
+    let mut flags = vec![false; num_layers];
+    for &l in capture_layers {
+        let f = flags.get_mut(l).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DFlash capture layer {l} is outside this target's {num_layers} text layers"
+            )
+        })?;
+        *f = true;
+    }
+    Ok(flags)
 }
 
 /// Tokens per batched prefill sub-chunk — the width `Glm5NextLayer::prefill` hands
@@ -676,7 +715,8 @@ impl Glm5NextLayer {
         )?;
 
         // 🪤 UNWEIGHTED mean, no weights. Not DeepSeek-V4's learned collapse.
-        if self.is_last {
+        // Also fired on a DFlash capture layer — see `capture_head_mean`.
+        if self.is_last || self.capture_head_mean {
             hc_head_mean(
                 gpu,
                 mhc.kernels.hc_head,
@@ -909,7 +949,9 @@ impl Glm5NextLayer {
             hct,
             stream,
         )?;
-        if self.is_last {
+        if self.is_last || self.capture_head_mean {
+            // Rows 0..kt of `hidden` become the collapsed highway — the row
+            // layout `try_dflash_capture_all_at` and the prefill capture read.
             hc_head_mean(
                 gpu,
                 mhc.kernels.hc_head,
@@ -1332,3 +1374,41 @@ impl TransformerLayer for Glm5NextLayer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dflash_capture_tests {
+    use super::dflash_capture_flags;
+
+    /// `incoai/GLM-5.3-Flash-DFlash2` taps `[5, 14, 24, 33, 42]` of 45 text
+    /// layers: exactly those five collapse, the last layer is untouched here
+    /// (it collapses through `is_last` regardless).
+    #[test]
+    fn glm53_flash_dflash2_taps_map_to_exactly_five_layers() {
+        let flags = dflash_capture_flags(45, &[5, 14, 24, 33, 42]).unwrap();
+        assert_eq!(flags.len(), 45);
+        let set: Vec<usize> = flags
+            .iter()
+            .enumerate()
+            .filter(|&(_, &f)| f)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(set, vec![5, 14, 24, 33, 42]);
+        assert!(
+            !flags[44],
+            "last text layer is not a tap; it collapses via is_last"
+        );
+    }
+
+    #[test]
+    fn no_drafter_means_no_capture() {
+        assert!(dflash_capture_flags(45, &[]).unwrap().iter().all(|&f| !f));
+    }
+
+    /// A tap past the target's layer count is a load error, never a silent
+    /// no-capture (that shape is the wrong-drafter / off-by-one class).
+    #[test]
+    fn out_of_range_tap_fails_closed() {
+        assert!(dflash_capture_flags(45, &[5, 45]).is_err());
+        assert!(dflash_capture_flags(0, &[0]).is_err());
+    }
+}

@@ -383,6 +383,34 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
             &dsa_cfg,
         )?;
         let last = skeleton.layers.len() - 1;
+        // DFlash capture layers (drafter `target_layer_ids`, set on `config`
+        // by the factory BEFORE construction). Fail-closed on a bad index.
+        // `ATLAS_GLM_DFLASH_CAPTURE=0` is the T1 discriminator: same image, capture
+        // OFF, so the drafter sees `hc_pre` scratch and acceptance collapses while
+        // everything else (dispatch, EP opcode, K rows, lossless verify) is exercised.
+        let capture_enabled =
+            std::env::var("ATLAS_GLM_DFLASH_CAPTURE").ok().as_deref() != Some("0");
+        if !capture_enabled && !config.dflash_capture_layers.is_empty() {
+            tracing::warn!(
+                "GLM-5.3 DFlash capture DISABLED by ATLAS_GLM_DFLASH_CAPTURE=0 — the drafter \
+                 will see pre-norm mixing scratch at {:?}; expect low acceptance (T1 arm)",
+                config.dflash_capture_layers
+            );
+        }
+        let capture_head_mean = crate::layers::glm5next_layer::dflash_capture_flags(
+            skeleton.layers.len(),
+            if capture_enabled {
+                &config.dflash_capture_layers
+            } else {
+                &[]
+            },
+        )?;
+        if capture_head_mean.iter().any(|&f| f) {
+            tracing::info!(
+                "GLM-5.3 DFlash capture: mHC highway collapsed (hc_head_mean) at layers {:?}",
+                config.dflash_capture_layers
+            );
+        }
         let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(skeleton.layers.len());
 
         // 🪤 The KV pool is sized to `num_attention_layers()` (11 on GLM-5.3 — the
@@ -501,6 +529,7 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                 },
                 is_first: idx == 0,
                 is_last: idx == last,
+                capture_head_mean: capture_head_mean[idx],
             }));
         }
         Ok(out)
