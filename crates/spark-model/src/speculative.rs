@@ -292,7 +292,10 @@ pub const EP_CMD_MTP_PROPOSE: u32 = 0xFFFF_FFF5;
 /// with rank 0. Payload after the code: `k` (u32), then `k` tokens via
 /// `ep_broadcast_tokens`; after the verify, `num_accepted` (u32).
 /// The fixed-width arms `0xFFFFFFF2/F3/F4` stay for K=2/3/4; this one serves
-/// every width the drafter's γ produces (γ=7 ⇒ K=8 on GLM-5.3).
+/// every width the drafter's γ produces. The drafter's row 0 is the `last_token`
+/// echo and is dropped (`propose.rs`), so γ ⇒ γ−1 drafts and the wire width is
+/// K = drafts + 1 = γ (γ=8 ⇒ K=8 on GLM-5.3). The pool's `γ+1` is the SSM
+/// reservation envelope, not this width.
 pub const EP_CMD_VERIFY_KGAMMA: u32 = 0xFFFF_FFF6;
 
 /// Run the drafter on EVERY rank with the communicator, instead of rank-0-only

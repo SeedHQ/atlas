@@ -748,7 +748,7 @@ mod kgamma_tests {
         assert_eq!(kgamma_worker_rollback(4, 0).unwrap(), (3, 1));
     }
 
-    /// γ=7 ⇒ K=8, the first-serve width on GLM-5.3: every outcome keeps
+    /// γ=8 ⇒ 7 drafts + last_token ⇒ K=8, the first-serve width on GLM-5.3: every outcome keeps
     /// `pop + total_accepted == k`, i.e. the worker's seq_len lands on rank 0's.
     #[test]
     fn k8_every_outcome_conserves_width() {
