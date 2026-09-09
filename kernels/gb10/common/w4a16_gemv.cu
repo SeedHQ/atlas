@@ -2281,6 +2281,17 @@ __device__ __forceinline__ void w4a16_gemv_partial_rows(
 #else
             float scale = (float)fp8 * scale2;
 #endif
+            // Row-invariant: decode the 16 FP4 values ONCE, not once per row.
+            // Every fmaf below keeps the identical operand pair in the identical
+            // order, so the result is bit-identical to the per-row decode by
+            // construction (gate: glm5next_moe_row_batch_microtest).
+            float w[16];
+            #pragma unroll
+            for (int b = 0; b < 8; b++) {
+                unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+                w[2 * b]     = lut[byte_val & 0xF];
+                w[2 * b + 1] = lut[byte_val >> 4];
+            }
             #pragma unroll
             for (int r = 0; r < R; r++) {
                 if (Aptr[r] == nullptr) continue;
@@ -2291,10 +2302,9 @@ __device__ __forceinline__ void w4a16_gemv_partial_rows(
                 float part = 0.0f;
                 #pragma unroll
                 for (int b = 0; b < 8; b++) {
-                    unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
                     float2 af = __bfloat1622float2(*(const __nv_bfloat162*)&a_raw[b]);
-                    part = fmaf(af.x, lut[byte_val & 0xF], part);
-                    part = fmaf(af.y, lut[byte_val >> 4], part);
+                    part = fmaf(af.x, w[2 * b],     part);
+                    part = fmaf(af.y, w[2 * b + 1], part);
                 }
                 if (c == 0) acc0[r] = fmaf(scale, part, acc0[r]);
                 else        acc1[r] = fmaf(scale, part, acc1[r]);
