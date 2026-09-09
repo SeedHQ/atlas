@@ -40,6 +40,10 @@ pub struct DflashKernels {
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
     pub w4a16_gemm: KernelHandle,
     pub dense_gemm_pipelined: KernelHandle,
+    /// Row-batched BF16 GEMV (`dense_gemv_bf16_batchm`, MAX_M 16) for the
+    /// drafter's M=γ≤8 GEMMs. Soft-resolved (`.0 == 0` when the target's
+    /// kernel table lacks it) — see `gemm_bf16_rows`.
+    pub dense_gemv_batchm: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// BF16 KV cache writeback. Used by Phase 2 `precompute_ctx_kv` and
@@ -902,6 +906,71 @@ impl DraftProposer for BlockDiffusionDraftHead {
 pub(crate) fn fp8_rt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_NO_DFLASH_FP8_RT").as_deref() != Ok("1"))
+}
+
+/// ATLAS_DFLASH_BF16_BATCHM=0 restores the 128-row tile GEMM for every drafter
+/// BF16 GEMM (A/B kill switch, strict `== "0"`). OnceLock so the kernel choice
+/// is stable across CUDA-graph capture.
+pub(crate) fn bf16_batchm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_BF16_BATCHM").as_deref() != Ok("0"))
+}
+
+impl BlockDiffusionDraftHead {
+    /// BF16 drafter GEMM row dispatch. Profiled 2026-09-07 (spark-bench quick
+    /// `260907-ldo`, nsys node trace, GLM-5.3-Flash γ=8 on 2×GB10): the 49
+    /// `dense_gemm_bf16_pipelined` launches per propose cost 26.3 ms/cycle —
+    /// the whole proposer — because the 128×128 tile pads 94 % of its rows at
+    /// M=8 and small-N shapes launch 8–32 CTAs on 48 SMs (42–130 GB/s; the
+    /// lm_head 161 GB/s). `dense_gemv_bf16_batchm` streams the same shapes at
+    /// ≈216 GB/s on the target side. Same layouts on both kernels (BF16 `[N,K]`
+    /// weight, `[M,K]` in, `[M,N]` out, no bias); `out_stride == n`. Band is
+    /// the frozen decode band (`DENSE_GEMV_BATCHM_DECODE_MAX_M` = 8, the
+    /// γ=8 block) and K % 8 == 0 (uint4 row loads). Drafter-side numerics are
+    /// correctness-free under strict-argmax accept: every draft is verified.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_bf16_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::layers::ops;
+        if self.kernels.dense_gemv_batchm.0 != 0
+            && (1..=ops::DENSE_GEMV_BATCHM_DECODE_MAX_M).contains(&m)
+            && k.is_multiple_of(8)
+            && bf16_batchm_enabled()
+        {
+            return ops::dense_gemv_batchm(
+                gpu,
+                self.kernels.dense_gemv_batchm,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                n,
+                stream,
+            );
+        }
+        ops::dense_gemm_bf16_pipelined(
+            gpu,
+            self.kernels.dense_gemm_pipelined,
+            input,
+            weight,
+            output,
+            m,
+            n,
+            k,
+            stream,
+        )
+    }
 }
 
 /// The DFlash context-window bound, in tokens: the most recent target

@@ -307,17 +307,7 @@ impl BlockDiffusionDraftHead {
                     stream,
                 );
             }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            self.gemm_bf16_rows(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
         };
 
         // 3b-q / 3c-q. Q branch: q_proj then q_norm — faithful to dflash.py:68-70.
@@ -1012,17 +1002,7 @@ impl BlockDiffusionDraftHead {
                     stream,
                 );
             }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            self.gemm_bf16_rows(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
         };
 
         // 3g. o_proj — γ rows, [q_dim → h].
