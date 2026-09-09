@@ -1011,7 +1011,9 @@ impl BlockDiffusionDraftHead {
         //   stream_acc ← o_proj(attn_out); stream_buf still holds the
         //   PRE-layernorm residual (saved implicitly — stream_buf was not
         //   modified since 3a wrote norm_buf from it).
-        if let Some((_, world)) = self.tp {
+        if let Some((_, world)) = self.tp
+            && self.tp_attn
+        {
             // Column-parallel o_proj: gather the per-rank attention heads into the
             // FULL `[g][world * q_dim]` K-side input, compute this rank's `h / world`
             // output rows, then gather those into the full-width `stream_acc`.

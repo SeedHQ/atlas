@@ -117,7 +117,9 @@ impl BlockDiffusionDraftHead {
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        if let Some((_, world)) = self.tp {
+        if let Some((_, world)) = self.tp
+            && self.tp_attn
+        {
             // Column-parallel fc: this rank's `h / world` output rows over the full
             // K, gathered into the full-width `fc_proj` for hidden_norm.
             let h_l = h / world as u32;

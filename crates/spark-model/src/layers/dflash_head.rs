@@ -493,6 +493,14 @@ pub struct BlockDiffusionDraftHead {
     /// element is the same dot product over the same K in the same kernel;
     /// only WHICH rows a rank computes changes, and gathers are copies.
     pub tp: Option<(usize, usize)>,
+    /// Proposer TP partition v1 (`ATLAS_DFLASH_PROPOSER_TP_ATTN=1`): ALSO shard
+    /// q/k/v heads, attention, o_proj and fc (gathers at attn_out, o_proj out,
+    /// fc out). Default false = v2: those stay replicated and only gate/up,
+    /// down_proj and lm_head are sharded. Measured 2026-09-09 (HANDOFF-26): a
+    /// collective as the FIRST node of a replayed graph pays ≈0.6 ms of NCCL
+    /// host-node startup with the GPU idle; v2 puts ≈0.6 ms of o_proj/gate/up
+    /// compute ahead of each layer's first gather so that latency is hidden.
+    pub tp_attn: bool,
 
     /// Paged FP8 KV cache. One cache holding all `num_layers` drafter layers,
     /// laid out the same way the target's KV cache is — block-table-keyed,
