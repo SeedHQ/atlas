@@ -288,6 +288,13 @@ pub fn hidden_fingerprint(gpu: &dyn GpuBackend, p: DevicePtr, h: usize) -> u64 {
 /// Payload after the code: `last_token`, `position`, `num_drafts` (3 x u32).
 pub const EP_CMD_MTP_PROPOSE: u32 = 0xFFFF_FFF5;
 
+/// EP worker command: run one variable-width K=γ verify (DFlash) in lockstep
+/// with rank 0. Payload after the code: `k` (u32), then `k` tokens via
+/// `ep_broadcast_tokens`; after the verify, `num_accepted` (u32).
+/// The fixed-width arms `0xFFFFFFF2/F3/F4` stay for K=2/3/4; this one serves
+/// every width the drafter's γ produces (γ=7 ⇒ K=8 on GLM-5.3).
+pub const EP_CMD_VERIFY_KGAMMA: u32 = 0xFFFF_FFF6;
+
 /// Run the drafter on EVERY rank with the communicator, instead of rank-0-only
 /// with `comm: None`. **DEFAULT ON since 2026-08-29**; kill switch
 /// `ATLAS_NO_MTP_EP_PROPOSE=1` restores the rank-0-only path.

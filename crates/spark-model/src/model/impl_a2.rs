@@ -609,6 +609,31 @@ impl TransformerModel {
                     }
                 }
             }
+            crate::speculative::EP_CMD_VERIFY_KGAMMA => {
+                // Verify K=γ (DFlash): receive k, then all k tokens in ONE bulk
+                // broadcast, run the same K=γ verify rank 0 runs, then receive
+                // num_accepted and mirror rank 0's bookkeeping EXACTLY
+                // (`verify_dflash_step.rs`): pop the rejected rows, commit the
+                // accepted prefix in place, trim the proposer. Variable-K so one
+                // arm serves every γ; the fixed K=2/3/4 arms above are untouched.
+                // Before this arm existed rank 0 entered layer 0's all-reduce
+                // while this worker was still blocked here: a hang, not an error.
+                let k = self.ep_broadcast_u32(0)? as usize;
+                if k < 2 {
+                    anyhow::bail!("EP verify K=γ: k={k} < 2 (need last_token + ≥1 draft)");
+                }
+                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                self.sync_secondary()?;
+                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                let (pop, total_accepted) = kgamma_worker_rollback(k, num_accepted)?;
+                for _ in 0..pop {
+                    seq.tokens.pop();
+                }
+                seq.seq_len -= pop;
+                self.commit_accepted_prefix(seq, total_accepted, k)?;
+                self.trim_proposer_state(seq, num_accepted, 0)?;
+            }
             token => {
                 // Regular decode
                 self.decode(token, seq, stream)?;
@@ -681,5 +706,87 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         self.decode_batch_compute_main(&tokens, &mut refs, stream)?;
         Ok(true)
+    }
+}
+
+/// Worker-side bookkeeping after a K=γ verify, as `(tokens_to_pop, total_accepted)`.
+///
+/// The verify advanced `seq_len` by `k` (last token + `k-1` drafts). Rank 0
+/// keeps `num_accepted` drafts plus one bonus position, so the worker pops
+/// `k - 1 - num_accepted` rows and commits `num_accepted + 1` rows — the same
+/// arithmetic `verify_dflash_step.rs` runs on rank 0, and the same table the
+/// fixed K=3/K=4 arms spell out literally (K=3: accept-2 → pop 0, accept-1 →
+/// pop 1, reject → pop 2). Fail-closed on `num_accepted ≥ k`: that shape is a
+/// bonus-token off-by-one and would under-pop into the next step.
+pub(crate) fn kgamma_worker_rollback(k: usize, num_accepted: usize) -> Result<(usize, usize)> {
+    if k < 2 {
+        anyhow::bail!("K=γ verify width {k} < 2");
+    }
+    if num_accepted >= k {
+        anyhow::bail!("K=γ verify: num_accepted {num_accepted} ≥ width {k} (at most k-1 drafts)");
+    }
+    Ok((k - 1 - num_accepted, num_accepted + 1))
+}
+
+#[cfg(test)]
+mod kgamma_tests {
+    use super::kgamma_worker_rollback;
+    use crate::speculative::{EP_CMD_MTP_PROPOSE, EP_CMD_VERIFY_KGAMMA};
+
+    /// The variable-width arm reproduces the literal fixed-width tables in
+    /// `ep_worker_dispatch_cmd` (K=3 and K=4 arms) exactly.
+    #[test]
+    fn reproduces_the_fixed_k3_and_k4_tables() {
+        // K=3: (num_accepted) → (pop, rollback arg = num_accepted + 1)
+        assert_eq!(kgamma_worker_rollback(3, 2).unwrap(), (0, 3));
+        assert_eq!(kgamma_worker_rollback(3, 1).unwrap(), (1, 2));
+        assert_eq!(kgamma_worker_rollback(3, 0).unwrap(), (2, 1));
+        // K=4
+        assert_eq!(kgamma_worker_rollback(4, 3).unwrap(), (0, 4));
+        assert_eq!(kgamma_worker_rollback(4, 2).unwrap(), (1, 3));
+        assert_eq!(kgamma_worker_rollback(4, 1).unwrap(), (2, 2));
+        assert_eq!(kgamma_worker_rollback(4, 0).unwrap(), (3, 1));
+    }
+
+    /// γ=7 ⇒ K=8, the first-serve width on GLM-5.3: every outcome keeps
+    /// `pop + total_accepted == k`, i.e. the worker's seq_len lands on rank 0's.
+    #[test]
+    fn k8_every_outcome_conserves_width() {
+        for na in 0..8 {
+            let (pop, total) = kgamma_worker_rollback(8, na).unwrap();
+            assert_eq!(pop + total, 8, "na={na}");
+            assert_eq!(total, na + 1);
+        }
+        assert_eq!(kgamma_worker_rollback(8, 7).unwrap(), (0, 8));
+        assert_eq!(kgamma_worker_rollback(8, 0).unwrap(), (7, 1));
+    }
+
+    #[test]
+    fn rejects_offbyone_and_degenerate_widths() {
+        assert!(
+            kgamma_worker_rollback(8, 8).is_err(),
+            "num_accepted == k is the bonus off-by-one"
+        );
+        assert!(kgamma_worker_rollback(8, 9).is_err());
+        assert!(kgamma_worker_rollback(1, 0).is_err());
+        assert!(kgamma_worker_rollback(0, 0).is_err());
+    }
+
+    /// The opcode must not collide with any existing command code or with the
+    /// token fall-through (all commands live at the top of the u32 space).
+    #[test]
+    fn opcode_is_distinct() {
+        let existing = [
+            0xFFFF_FFE0u32, // batched decode
+            0xFFFF_FFF0,    // prefill chunk
+            0xFFFF_FFF1,    // alloc slot
+            0xFFFF_FFF2,    // verify K=2
+            0xFFFF_FFF3,    // verify K=3
+            0xFFFF_FFF4,    // verify K=4
+            EP_CMD_MTP_PROPOSE,
+            0xFFFF_FFFF, // shutdown
+        ];
+        assert!(!existing.contains(&EP_CMD_VERIFY_KGAMMA));
+        assert!(EP_CMD_VERIFY_KGAMMA >= 0xFFFF_FFE0);
     }
 }

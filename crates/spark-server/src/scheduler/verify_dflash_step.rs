@@ -46,6 +46,24 @@ pub fn step_verify_dflash(
     tokens.push(a.last_token);
     tokens.extend_from_slice(drafts);
 
+    // EP: broadcast the K=γ verify command, the width, then every token in one
+    // bulk broadcast, so the worker runs `decode_verify_graphed_kgamma` in
+    // lockstep (impl_a2.rs `EP_CMD_VERIFY_KGAMMA` arm). Before this existed the
+    // worker sat blocked on its next command while rank 0 entered layer 0's
+    // all-reduce: a hang, not an error. Every call is a no-op on one rank.
+    if let Err(e) = model
+        .ep_broadcast_cmd_for_seq(
+            a.seq.slot_idx as u32,
+            spark_model::speculative::EP_CMD_VERIFY_KGAMMA,
+        )
+        .and_then(|()| model.ep_broadcast_cmd(tokens.len() as u32))
+        .and_then(|()| model.ep_broadcast_tokens(&tokens).map(|_| ()))
+    {
+        tracing::error!("EP broadcast verify_kgamma: {e:#}");
+        a.finished = true;
+        return;
+    }
+
     // STEP-TIMING (ATLAS_DFLASH_STEP_TIMING=1): split the ~0.88s/step into
     // verify (target M=1+γ forward) vs propose (drafter forward, tail below).
     // The ledger never had this split — it guessed "FFN + double sweep". This
@@ -104,6 +122,14 @@ pub fn step_verify_dflash(
         } else {
             break;
         }
+    }
+
+    // EP: ALWAYS broadcast num_accepted — the worker blocks on it after its
+    // verify (mirrors K=3's "prevents deadlock on EOS"). Before any early return.
+    if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
+        tracing::error!("EP broadcast verify_kgamma result: {e:#}");
+        a.finished = true;
+        return;
     }
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
