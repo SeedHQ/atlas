@@ -1151,6 +1151,18 @@ impl ServeArgs {
         self.dflash_gamma.or(drafter_block_size).unwrap_or(16)
     }
 
+    /// Drafts the scheduler asks a DFlash drafter for, from its resolved γ.
+    ///
+    /// The drafter's noise block has γ rows; row 0 is the `last_token` echo
+    /// and is dropped in `propose.rs`, so γ yields **γ−1 useful drafts**, and
+    /// the verify input `[last_token, drafts…]` is **K = γ on the wire**
+    /// (γ=8 ⇒ 7 drafts ⇒ K=8; γ=7 ⇒ K=7). The `γ+1` that sizes
+    /// `num_intermediates` is the SSM reservation envelope, not this width.
+    /// One helper so `serve_load` and `serve_phases::build` cannot drift.
+    pub fn dflash_num_drafts(gamma: usize) -> usize {
+        gamma.saturating_sub(1).max(1)
+    }
+
     pub fn resolved_num_drafts(&self) -> usize {
         self.num_drafts
             .expect("num_drafts read before apply_model_default_num_drafts resolved it")
@@ -1234,5 +1246,33 @@ mod stageable_spec_tests {
             parse_lora_stageable_spec("n=p=/weird/dir=x"),
             Ok(("n".to_string(), "p".to_string(), "/weird/dir=x".to_string()))
         );
+    }
+}
+
+#[cfg(test)]
+mod dflash_width_tests {
+    use super::ServeArgs;
+
+    /// γ=8 is the GLM-5.3 first-serve width: 7 useful drafts, wire K=8 — the
+    /// bit-identical 8-row decode tier. γ=7 is wire K=7, not 8.
+    #[test]
+    fn gamma_8_is_seven_drafts_and_wire_k_8() {
+        let num_drafts = ServeArgs::dflash_num_drafts(8);
+        assert_eq!(num_drafts, 7);
+        let wire_k = num_drafts + 1; // [last_token] ++ drafts
+        assert_eq!(wire_k, 8);
+        assert_eq!(ServeArgs::dflash_num_drafts(7) + 1, 7, "γ=7 is wire K=7");
+        assert_eq!(
+            ServeArgs::dflash_num_drafts(10) + 1,
+            10,
+            "default γ=10 is wire K=10"
+        );
+    }
+
+    /// Degenerate γ never asks for zero drafts (the K=2 ladder floor).
+    #[test]
+    fn gamma_floor_is_one_draft() {
+        assert_eq!(ServeArgs::dflash_num_drafts(1), 1);
+        assert_eq!(ServeArgs::dflash_num_drafts(0), 1);
     }
 }

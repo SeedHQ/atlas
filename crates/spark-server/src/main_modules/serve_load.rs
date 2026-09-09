@@ -919,7 +919,7 @@ pub(crate) fn load_model(
         let g = scheduler_model
             .dflash_gamma()
             .unwrap_or_else(|| args.resolved_dflash_gamma(None));
-        g.saturating_sub(1).max(1)
+        crate::cli::ServeArgs::dflash_num_drafts(g)
     } else {
         args.resolved_num_drafts()
     };

@@ -104,7 +104,7 @@ pub(crate) fn build_model(
             // num_drafts from the built head's gamma (the SSOT) afterwards;
             // this value only sizes buffers, and legacy 16 is the upper
             // bound of every published drafter's block size.
-            args.resolved_dflash_gamma(None).saturating_sub(1).max(1)
+            cli::ServeArgs::dflash_num_drafts(args.resolved_dflash_gamma(None))
         } else {
             args.resolved_num_drafts()
         },
